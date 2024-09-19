@@ -25,10 +25,7 @@ contract OrderBasedSwap {
     mapping(uint256 => Order) public orders;
     mapping(address => uint256[]) public depositorToOrderIds;
 
-    event OrderCreated(uint256 indexed orderId, address indexed depositor, address depositToken, uint256 depositAmount, address desiredToken, uint256 desiredAmount);
-    event OrderCompleted(uint256 indexed orderId, address indexed buyer, address depositToken, uint256 depositAmount, address desiredToken, uint256 desiredAmount);
-    event OrderCanceled(uint256 indexed orderId, address indexed depositor);
-
+    
     function createOrder(
         IERC20 _depositToken,
         uint256 _depositAmount,
@@ -74,5 +71,64 @@ contract OrderBasedSwap {
         Events.emitOrderCreated(msg.sender, address(_depositToken), _depositAmount, address(_desiredToken), _desiredAmount, block.timestamp);
     }
 
-    
+    function fulfillOrder(uint256 _orderId) external {
+        Errors.zeroValueCheck(_orderId);
+        Errors.checkIfOrderExists(orders[_orderId].id);
+
+        Order storage order = orders[_orderId];
+
+        // Validate order status
+        if (order.isCompleted) revert Errors.OrderCompletedAlready();
+        if (order.isCanceled) revert Errors.OrderCanceledAlready();
+
+        // Check buyer balance and allowance
+        if (order.desiredAmount > order.desiredToken.balanceOf(msg.sender)) {
+            revert Errors.InSufficientBalance();
+        }
+
+        // Mark order as completed
+        order.isCompleted = true;
+        order.buyer = msg.sender;
+
+        // Transfer desired tokens from buyer to depositor
+        if (!order.desiredToken.transferFrom(msg.sender, order.depositor, order.desiredAmount)) {
+            revert Errors.TransferToDepositorFailed();
+        }
+
+        // Transfer deposit tokens from contract to buyer
+        if (!order.depositToken.transfer(msg.sender, order.depositAmount)) {
+            revert Errors.TransferToBuyerFailed();
+        }
+
+        // Emit order completion event
+        Events.emitOrderCompleted(order.id, msg.sender, address(order.depositToken), order.depositAmount, address(order.desiredToken), order.desiredAmount, block.timestamp);
+    }
+
+    function cancelOrder(uint256 _orderId) external {
+        Errors.zeroValueCheck(_orderId);
+        Errors.checkIfOrderExists(orders[_orderId].id);
+
+        Order storage order = orders[_orderId];
+
+        // Only depositor can cancel
+        if (order.depositor != msg.sender) {
+            revert Errors.NotOwnerOfOrder();
+        }
+
+        // Check if order is already completed or canceled
+        if (order.isCompleted) revert Errors.OrderCompletedAlready();
+        if (order.isCanceled) revert Errors.OrderCanceledAlready();
+
+        // Mark order as canceled
+        order.isCanceled = true;
+        order.timeCanceled = block.timestamp;
+
+        // Return deposited tokens to depositor
+        if (!order.depositToken.transfer(msg.sender, order.depositAmount)) {
+            revert Errors.TransferToDepositorFailed();
+        }
+
+        // Emit order cancellation event
+        Events.emitOrderCanceled(order.id, msg.sender, address(order.depositToken), order.depositAmount, block.timestamp);
+    }
 }
