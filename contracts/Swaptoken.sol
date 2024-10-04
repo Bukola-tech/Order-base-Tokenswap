@@ -1,134 +1,228 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: UNLICENSED
 pragma solidity ^0.8.24;
+import "./interfaces/IERC20.sol";
+import "./Libraries.sol";
 
-import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
-import "./libraries/Events.sol";
-import "./libraries/Errors.sol";
+// Uncomment this line to use console.log
+// import "hardhat/console.sol";
 
 contract OrderBasedSwap {
-    uint256 public orderCounter;
+    uint256 public orderCount;
 
-    struct Order {
+    struct SwapOrder {
         uint256 id;
-        address depositor;
-        IERC20 depositToken;
-        uint256 depositAmount;
-        IERC20 desiredToken;
-        uint256 desiredAmount;
+        uint256 amountIn;
+        uint256 amountOut;
         bool isCompleted;
         bool isCanceled;
+        address tokenIn;
+        address tokenOut;
+        address depositor;
         address buyer;
         uint256 timeCreated;
-        uint256 timeCanceled;
+        uint256 timeCancelled;
     }
 
-    mapping(uint256 => Order) public orders;
-    mapping(address => uint256[]) public depositorToOrderIds;
+    // maps orderId to Swap
+    mapping(uint => SwapOrder) idToSwapOrder;
 
-    
+    // map depositor to createdOrderIds: This is for depositors to close orders if no buyer shows up
+    mapping(address => uint256[]) depositorToCreatedOrderIds;
+
+    // @dev: private functions
+    function sanityCheck(address _user) private pure {
+        if (_user == address(0)) {
+            revert Errors.ZeroAddressNotAllowed();
+        }
+    }
+
+    function zeroValueCheck(uint256 _amount) private pure {
+        if (_amount <= 0) {
+            revert Errors.ZeroValueNotAllowed();
+        }
+    }
+
+    function getUserTokenBalance(
+        address _tokenAddress,
+        address _user
+    ) private view returns (uint) {
+        sanityCheck(_tokenAddress);
+        sanityCheck(_user);
+        return IERC20(_tokenAddress).balanceOf(_user);
+    }
+
+    function checkIfOrderExists(uint256 _orderId) private view returns (bool) {
+        if (idToSwapOrder[_orderId].id == 0) {
+            return false;
+        }
+        return true;
+    }
+
+    // @user: User functions
+
+    function getOrder(uint256 _orderId) external view returns (SwapOrder memory) {
+        if (!checkIfOrderExists(_orderId)) {
+            revert Errors.InvalidOrder();
+        }
+        return idToSwapOrder[_orderId];
+    }
+
+    function getMyOrders() external view returns (uint256[] memory) {
+        sanityCheck(msg.sender);
+        return depositorToCreatedOrderIds[msg.sender];
+    }
+
+    // @dev: creates an order by allowing deposits X amount of token A expecting Y amount of tokenB in return
+    // @user: user approval is needed for this function to run successfully
     function createOrder(
-        IERC20 _depositToken,
-        uint256 _depositAmount,
-        IERC20 _desiredToken,
-        uint256 _desiredAmount
+        uint256 _amountIn,
+        address _tokenIn,
+        uint256 _amountOut,
+        address _tokenOut
     ) external {
-        // Basic checks
-        Errors.sanityCheck(msg.sender);
-        Errors.sanityCheck(address(_depositToken));
-        Errors.sanityCheck(address(_desiredToken));
-        Errors.zeroValueCheck(_depositAmount);
-        Errors.zeroValueCheck(_desiredAmount);
+        sanityCheck(msg.sender);
+        sanityCheck(_tokenIn);
+        sanityCheck(_tokenOut);
+        zeroValueCheck(_amountIn);
+        zeroValueCheck(_amountOut);
 
-        // Check for sufficient balance and allowance
-        if (_depositAmount > _depositToken.balanceOf(msg.sender)) {
+        if (_amountIn > getUserTokenBalance(_tokenIn, msg.sender)) {
             revert Errors.InSufficientBalance();
         }
 
-        if (!_depositToken.transferFrom(msg.sender, address(this), _depositAmount)) {
+        if (
+            !IERC20(_tokenIn).transferFrom(msg.sender, address(this), _amountIn)
+        ) {
             revert Errors.DepositFailed();
         }
 
-        // Create new order
-        uint256 orderId = ++orderCounter;
-        orders[orderId] = Order({
-            id: orderId,
-            depositor: msg.sender,
-            depositToken: _depositToken,
-            depositAmount: _depositAmount,
-            desiredToken: _desiredToken,
-            desiredAmount: _desiredAmount,
-            isCompleted: false,
-            isCanceled: false,
-            buyer: address(0),
-            timeCreated: block.timestamp,
-            timeCanceled: 0
-        });
+        uint256 _orderCount = orderCount + 1;
+        // on creation, the buyer address is address zero because it has not beebn bought
+        // basically like a default address
+        SwapOrder memory newSwapOrder = SwapOrder(
+            _orderCount,
+            _amountIn,
+            _amountOut,
+            false,
+            false,
+            _tokenIn,
+            _tokenOut,
+            msg.sender,
+            address(0),
+            block.timestamp,
+            0
+        );
+        idToSwapOrder[_orderCount] = newSwapOrder;
 
-        // Track order for depositor
-        depositorToOrderIds[msg.sender].push(orderId);
+        depositorToCreatedOrderIds[msg.sender].push(_orderCount);
 
-        // Emit order creation event
-        Events.emitOrderCreated(msg.sender, address(_depositToken), _depositAmount, address(_desiredToken), _desiredAmount, block.timestamp);
+        orderCount++;
+
+        emit Events.OrderCreatedSuccessfully(
+            msg.sender,
+            _tokenIn,
+            _amountIn,
+            _amountOut,
+            _tokenOut,
+            newSwapOrder.timeCreated
+        );
     }
 
-    function fulfillOrder(uint256 _orderId) external {
-        Errors.zeroValueCheck(_orderId);
-        Errors.checkIfOrderExists(orders[_orderId].id);
+    // @user: user can buy an order
+    // the user needs to approve
+    function buyOrder(uint256 _orderId) external {
+        sanityCheck(msg.sender);
+        zeroValueCheck(_orderId);
+        if (!checkIfOrderExists(_orderId)) {
+            revert Errors.InvalidOrder();
+        }
 
-        Order storage order = orders[_orderId];
+        SwapOrder memory swapOrder = idToSwapOrder[_orderId];
 
-        // Validate order status
-        if (order.isCompleted) revert Errors.OrderCompletedAlready();
-        if (order.isCanceled) revert Errors.OrderCanceledAlready();
+        if (swapOrder.isCompleted) {
+            revert Errors.OrderCompletedAlready();
+        }
 
-        // Check buyer balance and allowance
-        if (order.desiredAmount > order.desiredToken.balanceOf(msg.sender)) {
+        if (swapOrder.isCanceled) {
+            revert Errors.OrderCanceledAlready();
+        }
+
+        uint256 buyerTokenOutBalance = getUserTokenBalance(
+            swapOrder.tokenOut,
+            msg.sender
+        );
+        // check if buyer has enough tokens specified by the depositor as tokenOut
+        if (swapOrder.amountOut > buyerTokenOutBalance) {
             revert Errors.InSufficientBalance();
         }
 
-        // Mark order as completed
-        order.isCompleted = true;
-        order.buyer = msg.sender;
+        // to prevent reentrancy
+        idToSwapOrder[_orderId].isCompleted = true;
 
-        // Transfer desired tokens from buyer to depositor
-        if (!order.desiredToken.transferFrom(msg.sender, order.depositor, order.desiredAmount)) {
+        // trasfer amountOut of tokenOut to the depositor
+        if (
+            !IERC20(swapOrder.tokenOut).transferFrom(
+                msg.sender,
+                swapOrder.depositor,
+                swapOrder.amountOut
+            )
+        ) {
             revert Errors.TransferToDepositorFailed();
         }
 
-        // Transfer deposit tokens from contract to buyer
-        if (!order.depositToken.transfer(msg.sender, order.depositAmount)) {
+        // transfer amountIn of tokenIn to the buyer
+        if (
+            !IERC20(swapOrder.tokenIn).transfer(msg.sender, swapOrder.amountIn)
+        ) {
             revert Errors.TransferToBuyerFailed();
         }
 
-        // Emit order completion event
-        Events.emitOrderCompleted(order.id, msg.sender, address(order.depositToken), order.depositAmount, address(order.desiredToken), order.desiredAmount, block.timestamp);
+        emit Events.OrderExecutedSuccessfully(
+            msg.sender,
+            swapOrder.amountOut,
+            swapOrder.amountIn,
+            swapOrder.depositor,
+            swapOrder.tokenOut,
+            swapOrder.tokenIn,
+            block.timestamp
+        );
     }
 
     function cancelOrder(uint256 _orderId) external {
-        Errors.zeroValueCheck(_orderId);
-        Errors.checkIfOrderExists(orders[_orderId].id);
+        sanityCheck(msg.sender);
+        zeroValueCheck(_orderId);
+        if (!checkIfOrderExists(_orderId)) {
+            revert Errors.InvalidOrder();
+        }
 
-        Order storage order = orders[_orderId];
+        SwapOrder memory swapOrder = idToSwapOrder[_orderId];
 
-        // Only depositor can cancel
-        if (order.depositor != msg.sender) {
+        if (swapOrder.depositor != msg.sender) {
             revert Errors.NotOwnerOfOrder();
         }
 
-        // Check if order is already completed or canceled
-        if (order.isCompleted) revert Errors.OrderCompletedAlready();
-        if (order.isCanceled) revert Errors.OrderCanceledAlready();
+        if (swapOrder.isCompleted) {
+            revert Errors.OrderCompletedAlready();
+        }
 
-        // Mark order as canceled
-        order.isCanceled = true;
-        order.timeCanceled = block.timestamp;
+        if (swapOrder.isCanceled) {
+            revert Errors.OrderCanceledAlready();
+        }
 
-        // Return deposited tokens to depositor
-        if (!order.depositToken.transfer(msg.sender, order.depositAmount)) {
+        idToSwapOrder[_orderId].isCanceled = true;
+        idToSwapOrder[_orderId].timeCancelled = block.timestamp;
+
+        if (
+            !IERC20(swapOrder.tokenIn).transfer(msg.sender, swapOrder.amountIn)
+        ) {
             revert Errors.TransferToDepositorFailed();
         }
 
-        // Emit order cancellation event
-        Events.emitOrderCanceled(order.id, msg.sender, address(order.depositToken), order.depositAmount, block.timestamp);
+        emit Events.OrderCancelledSuccessfully(
+            swapOrder.depositor,
+            swapOrder.tokenIn,
+            swapOrder.amountIn,
+            block.timestamp
+        );
     }
 }
